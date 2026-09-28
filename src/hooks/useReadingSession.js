@@ -5,7 +5,7 @@ import { fuzzyMatch, getPunctuationType, calculateWPM } from '../utils/textProce
 /**
  * Reading session state machine.
  * - Words turn GREEN when pronounced correctly.
- * - Words turn RED ONLY when the spoken word is completed and WRONG (mali ang pagsasalita).
+ * - Words turn RED when moving to the next word confirms that one was skipped.
  * - Tracks observance of punctuation pauses (comma, period, question mark).
  * - Continuous timer (no pause).
  */
@@ -119,6 +119,11 @@ export function useReadingSession() {
 
     while (tokenIdx < spokenTokens.length && targetIdx < storyWords.length) {
       const token = spokenTokens[tokenIdx];
+
+      // Never score a mutable recognition hypothesis. This guard must run before
+      // both direct matching and lookahead so partial words cannot advance.
+      if (!token?.isComplete) break;
+
       const targetWord = storyWords[targetIdx];
 
       // 1. Direct match with expected word
@@ -144,19 +149,9 @@ export function useReadingSession() {
         continue;
       }
 
-      // 3. Token did NOT match targetIdx and did NOT match targetIdx + 1.
-      // If the word is still in the middle of being spoken (interim), WAIT!
-      if (!token.isComplete) {
-        break;
-      }
-
-      // 4. Token IS complete, and what was spoken is WRONG (mali ang pagsasalita)!
-      // Ignore 1-character breath/murmur tokens
-      if (token.word.length >= 2) {
-        checkPreviousPunctuation();
-        newErrors.push(targetIdx); // Word turns RED!
-        targetIdx++;
-      }
+      // A finalized fragment or background sound is not enough evidence that the
+      // reader skipped this word. Consume it but keep the target active for a retry.
+      // If the reader later says the following word, lookahead records the skip.
       tokenIdx++;
     }
 

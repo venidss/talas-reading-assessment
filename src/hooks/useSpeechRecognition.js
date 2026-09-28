@@ -3,7 +3,7 @@ import { normalizeWord } from '../utils/textProcessing';
 
 /**
  * Speech Recognition Hook
- * Streams normalized spoken tokens with completion status (isComplete)
+ * Streams an append-only ledger of normalized, finalized spoken words
  * for accurate word-by-word reading assessment.
  */
 export function useSpeechRecognition() {
@@ -25,35 +25,26 @@ export function useSpeechRecognition() {
       recognition.maxAlternatives = 1;
 
       recognition.onresult = (event) => {
-        const tokens = [];
+        const finalizedTokens = [];
 
-        for (let i = 0; i < event.results.length; i++) {
-          const res = event.results[i];
-          if (!res || !res[0]) continue;
+        // Interim transcripts are mutable guesses. Committing only newly finalized
+        // results prevents partial words from advancing the assessment.
+        for (let i = event.resultIndex ?? 0; i < event.results.length; i++) {
+          const result = event.results[i];
+          if (!result?.isFinal || !result[0]) continue;
 
-          const transcript = res[0].transcript.trim();
-          const isFinal = res.isFinal;
-          if (!transcript) continue;
-
-          const rawWords = transcript.split(/\s+/).filter(Boolean);
-          rawWords.forEach((w, wordIdx) => {
-            const normalized = normalizeWord(w);
-            if (!normalized) return;
-
-            // A word is complete if the whole result is finalized,
-            // or if it is followed by subsequent words in the transcript.
-            const isComplete = isFinal || wordIdx < rawWords.length - 1;
-
-            tokens.push({
-              word: normalized,
-              isComplete,
-            });
+          const rawWords = result[0].transcript.trim().split(/\s+/).filter(Boolean);
+          rawWords.forEach((rawWord) => {
+            const word = normalizeWord(rawWord);
+            if (word) finalizedTokens.push({ word, isComplete: true });
           });
         }
 
-        if (tokens.length > 0) {
-          setSpokenTokens(tokens);
-          setRecognitionVersion((v) => v + 1);
+        if (finalizedTokens.length > 0) {
+          // Keep an append-only ledger so the session's consumed-token cursor
+          // remains valid across pauses and automatic recognition restarts.
+          setSpokenTokens((previous) => [...previous, ...finalizedTokens]);
+          setRecognitionVersion((version) => version + 1);
         }
       };
 
@@ -92,8 +83,7 @@ export function useSpeechRecognition() {
 
   const start = useCallback(() => {
     if (!recognitionRef.current) return;
-    setSpokenTokens([]);
-    setRecognitionVersion(0);
+    // Preserve finalized tokens when the microphone is paused and resumed.
     recognitionRef.current._shouldListen = true;
     try {
       recognitionRef.current.start();
