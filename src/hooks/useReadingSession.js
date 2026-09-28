@@ -4,17 +4,23 @@ import { fuzzyMatch, getPunctuationType, calculateWPM } from '../utils/textProce
 
 /**
  * Reading session state machine.
- * - Words turn GREEN when pronounced correctly.
- * - Words turn RED when moving to the next word confirms that one was skipped.
- * - Tracks observance of punctuation pauses (comma, period, question mark).
- * - Continuous timer (no pause).
+ *
+ * Design notes for tryMatchTokens:
+ * - elapsedTime is intentionally NOT in the useCallback dependency array.
+ *   Reading it via a ref instead avoids recreating the function every second,
+ *   which would cause stale closures and missed token batches.
+ * - Lookahead scans up to LOOKAHEAD_LIMIT words ahead so that a skipped word
+ *   is detected even if the reader skips more than one at a time.
  */
+
+const LOOKAHEAD_LIMIT = 3; // how many words ahead to scan for a skip match
+
 export function useReadingSession() {
   const [currentWordIndex, setCurrentWordIndex] = useState(0);
-  const [completedWords, setCompletedWords] = useState(new Set()); // GREEN words
-  const [errorWords, setErrorWords] = useState(new Set()); // RED words
-  const [missedPunctuations, setMissedPunctuations] = useState(new Set()); // RED punctuation
-  const [punctuationEvents, setPunctuationEvents] = useState([]); // Correctly observed pauses
+  const [completedWords, setCompletedWords] = useState(new Set());
+  const [errorWords, setErrorWords] = useState(new Set());
+  const [missedPunctuations, setMissedPunctuations] = useState(new Set());
+  const [punctuationEvents, setPunctuationEvents] = useState([]);
   const [activePunctuation, setActivePunctuation] = useState(null);
   const [sentencesCompleted, setSentencesCompleted] = useState(new Set());
   const [justCompletedWord, setJustCompletedWord] = useState(null);
@@ -28,15 +34,35 @@ export function useReadingSession() {
   const currentWordIndexRef = useRef(0);
   const consumedTokenIndexRef = useRef(0);
 
+  // Use a ref for elapsedTime so tryMatchTokens can read the current value
+  // without being listed as a dependency (which would recreate it every second).
+  const elapsedTimeRef = useRef(0);
+
+  // Reading-state flags exposed as refs so tryMatchTokens never goes stale
+  const readingStartedRef = useRef(false);
+  const readingFinishedRef = useRef(false);
+
   // Punctuation compliance tracking refs
   const lastPunctuationTimeRef = useRef(null);
   const lastPunctuationWordRef = useRef(null);
   const lastPunctuationTypeRef = useRef(null);
 
-  // Sync ref with state
+  // Keep refs in sync with state
   useEffect(() => {
     currentWordIndexRef.current = currentWordIndex;
   }, [currentWordIndex]);
+
+  useEffect(() => {
+    elapsedTimeRef.current = elapsedTime;
+  }, [elapsedTime]);
+
+  useEffect(() => {
+    readingStartedRef.current = readingStarted;
+  }, [readingStarted]);
+
+  useEffect(() => {
+    readingFinishedRef.current = readingFinished;
+  }, [readingFinished]);
 
   // Continuous timer
   useEffect(() => {
@@ -51,7 +77,7 @@ export function useReadingSession() {
   }, [readingStarted, readingFinished]);
 
   /**
-   * Helper: check if student paused appropriately at previous punctuation
+   * Check whether the reader paused long enough at the previous punctuation mark.
    */
   const checkPreviousPunctuation = useCallback(() => {
     if (lastPunctuationTimeRef.current == null) return;
@@ -60,9 +86,7 @@ export function useReadingSession() {
     const punctType = lastPunctuationTypeRef.current;
     const wordIdx = lastPunctuationWordRef.current;
 
-    // Required pause:
-    // Comma: at least 350ms
-    // Period / Question / Exclamation: at least 650ms
+    // Comma: ≥ 350 ms   Period / Question / Exclamation: ≥ 650 ms
     const minRequired = punctType === 'comma' ? 350 : 650;
 
     if (pauseDuration < minRequired) {
@@ -80,7 +104,7 @@ export function useReadingSession() {
   }, []);
 
   /**
-   * Arm punctuation timer if a word has punctuation
+   * Arm a punctuation pause timer if the completed word has trailing punctuation.
    */
   const armPunctuationIfAny = useCallback((wordIdx) => {
     const word = storyWords[wordIdx];
@@ -88,27 +112,39 @@ export function useReadingSession() {
 
     const punct = word.punctuationAfter;
     const punctType = getPunctuationType(punct);
-    if (punctType) {
-      lastPunctuationTimeRef.current = Date.now();
-      lastPunctuationWordRef.current = wordIdx;
-      lastPunctuationTypeRef.current = punctType;
-      setActivePunctuation({ type: punctType, wordIndex: wordIdx });
-      setTimeout(() => setActivePunctuation(null), 800);
+    if (!punctType) return;
 
-      if (punctType === 'period' || punctType === 'question' || punctType === 'exclamation') {
-        setSentencesCompleted((prev) => new Set(prev).add(word.sentenceIndex));
-        setJustCompletedSentence(true);
-        setTimeout(() => setJustCompletedSentence(false), 1200);
-      }
+    lastPunctuationTimeRef.current = Date.now();
+    lastPunctuationWordRef.current = wordIdx;
+    lastPunctuationTypeRef.current = punctType;
+    setActivePunctuation({ type: punctType, wordIndex: wordIdx });
+    setTimeout(() => setActivePunctuation(null), 800);
+
+    if (punctType === 'period' || punctType === 'question' || punctType === 'exclamation') {
+      setSentencesCompleted((prev) => new Set(prev).add(word.sentenceIndex));
+      setJustCompletedSentence(true);
+      setTimeout(() => setJustCompletedSentence(false), 1200);
     }
   }, []);
 
   /**
-   * Process incoming tokens:
-   * Consumes tokens sequentially so every spoken word is accurately evaluated.
+   * Process incoming tokens against the expected word list.
+   *
+   * Token consumption rules:
+   * 1. Direct match   — advance both token and target pointers.
+   * 2. Lookahead match — scan up to LOOKAHEAD_LIMIT words ahead; mark all
+   *    skipped words as errors, mark the matched word as correct.
+   * 3. No match       — consume the token (noise / mispronunciation) but keep
+   *    the target pointer so the reader can retry the same word.
+   *
+   * Stability gate: incomplete (interim trailing) tokens are never scored.
+   *
+   * NOTE: elapsedTime is read from elapsedTimeRef so this function can be
+   * stable (no timer-driven recreation every second).
    */
   const tryMatchTokens = useCallback((spokenTokens) => {
-    if (readingFinished || !readingStarted) return false;
+    // Read flags from refs to avoid stale closure issues
+    if (readingFinishedRef.current || !readingStartedRef.current) return false;
     if (!spokenTokens || spokenTokens.length === 0) return false;
 
     let tokenIdx = consumedTokenIndexRef.current;
@@ -120,13 +156,13 @@ export function useReadingSession() {
     while (tokenIdx < spokenTokens.length && targetIdx < storyWords.length) {
       const token = spokenTokens[tokenIdx];
 
-      // Never score a mutable recognition hypothesis. This guard must run before
-      // both direct matching and lookahead so partial words cannot advance.
+      // Never score an unstable interim word — wait until it is finalized or
+      // promoted by the arrival of a subsequent recognition segment.
       if (!token?.isComplete) break;
 
       const targetWord = storyWords[targetIdx];
 
-      // 1. Direct match with expected word
+      // 1. Direct match with the expected word
       if (fuzzyMatch(targetWord.cleanText, token.word)) {
         checkPreviousPunctuation();
         newCompleted.push(targetIdx);
@@ -136,22 +172,31 @@ export function useReadingSession() {
         continue;
       }
 
-      // 2. Lookahead check: did student skip targetIdx and speak targetIdx + 1?
-      if (targetIdx + 1 < storyWords.length && fuzzyMatch(storyWords[targetIdx + 1].cleanText, token.word)) {
-        checkPreviousPunctuation();
-        // targetIdx was skipped -> mark RED
-        newErrors.push(targetIdx);
-        // targetIdx + 1 was correctly spoken -> mark GREEN
-        newCompleted.push(targetIdx + 1);
-        armPunctuationIfAny(targetIdx + 1);
-        targetIdx = targetIdx + 2;
-        tokenIdx++;
-        continue;
-      }
+      // 2. Lookahead: did the reader skip one or more words?
+      //    Scan up to LOOKAHEAD_LIMIT positions ahead for a match.
+      let lookaheadMatched = false;
+      for (let skip = 1; skip <= LOOKAHEAD_LIMIT; skip++) {
+        const lookaheadIdx = targetIdx + skip;
+        if (lookaheadIdx >= storyWords.length) break;
 
-      // A finalized fragment or background sound is not enough evidence that the
-      // reader skipped this word. Consume it but keep the target active for a retry.
-      // If the reader later says the following word, lookahead records the skip.
+        if (fuzzyMatch(storyWords[lookaheadIdx].cleanText, token.word)) {
+          checkPreviousPunctuation();
+          // Mark all skipped words as errors
+          for (let s = 0; s < skip; s++) {
+            newErrors.push(targetIdx + s);
+          }
+          // Mark the matched word as correct
+          newCompleted.push(lookaheadIdx);
+          armPunctuationIfAny(lookaheadIdx);
+          targetIdx = lookaheadIdx + 1;
+          tokenIdx++;
+          lookaheadMatched = true;
+          break;
+        }
+      }
+      if (lookaheadMatched) continue;
+
+      // 3. No match — consume the token (noise / wrong word) and retry the target.
       tokenIdx++;
     }
 
@@ -178,12 +223,13 @@ export function useReadingSession() {
       });
     }
 
-    // Timestamps
+    // Timestamps — read elapsed time from ref (no dependency needed)
+    const now = elapsedTimeRef.current;
     [...newCompleted, ...newErrors].forEach((idx) => {
-      wordTimestampsRef.current.push({ index: idx, time: elapsedTime });
+      wordTimestampsRef.current.push({ index: idx, time: now });
     });
 
-    // Check completion
+    // Check for story completion
     if (targetIdx >= storyWords.length) {
       checkPreviousPunctuation();
       setReadingFinished(true);
@@ -194,21 +240,20 @@ export function useReadingSession() {
     }
 
     return newCompleted.length > 0 || newErrors.length > 0;
-  }, [readingFinished, readingStarted, elapsedTime, checkPreviousPunctuation, armPunctuationIfAny]);
+    // elapsedTime deliberately omitted — read via elapsedTimeRef instead.
+  }, [checkPreviousPunctuation, armPunctuationIfAny]);
 
-  /**
-   * Start reading
-   */
   const startReading = useCallback(() => {
     setReadingStarted(true);
   }, []);
 
-  /**
-   * Restart session
-   */
   const restart = useCallback(() => {
     currentWordIndexRef.current = 0;
     consumedTokenIndexRef.current = 0;
+    elapsedTimeRef.current = 0;
+    readingStartedRef.current = false;
+    readingFinishedRef.current = false;
+
     setCurrentWordIndex(0);
     setCompletedWords(new Set());
     setErrorWords(new Set());
